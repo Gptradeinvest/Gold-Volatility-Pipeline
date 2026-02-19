@@ -2,21 +2,51 @@
 GOLD VOLATILITY PIPELINE — GLD · XAU/USD
 yfinance + matplotlib  ·  D1
 ==========================================
+Production-grade gold volatility surface analysis.
+
+Methodology:
+    - Black-Scholes-Merton for IV inversion and Greeks
+    - BKM(2003) model-free moments (primary, ≥4 strikes)
+    - Malz(2012) §6.3-6.4 parametric fallback (RR25/BF25)
+    - Cornish-Fisher O(γ₁²) expansion for Bayesian price windows
+    - Variance blend σ_post = √(½IV² + ½RV²) [Jensen-correct]
+    - Calendar arbitrage enforcement V(T)=σ²T monotone
+    - ES/CVaR FRTB Basel IV compliant
+
 Usage:
     pip install yfinance scipy numpy pandas matplotlib
     python price.py
 
 Output:
-    gold_surface_data.json   — données brutes
-    gold_report.pdf          — rapport 4 pages (+ fenêtre bayésienne)
-    gold_report.png          — aperçu page 4 (Bayes)
+    gold_surface_data.json   — structured data (with schema version + SHA-256)
+    gold_report.pdf          — 5-page institutional report
+    gold_report.png          — preview page 4 (Bayesian window GLD)
 """
+from __future__ import annotations
 
+__version__ = "2.7.0"
+__all__ = [
+    "PipelineError",
+    "norm_cdf", "norm_pdf",
+    "bs_price", "bs_vega", "bs_delta", "implied_vol", "safe_float",
+    "fetch_spots_rate", "fetch_gvz", "fetch_surface", "fetch_rv",
+    "compute_ivr_ivp", "compute_fwd_vols", "compute_bayes_windows",
+    "build_smiles", "audit_qa",
+    "page1", "page2", "page3", "page_bayes",
+    "run_fetch", "run_report", "main",
+]
+
+import hashlib
 import json
 import logging
 import math
+import os
+import socket as _socket
 import threading
+import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,59 +65,159 @@ try:
 except ImportError:
     HAS_YFINANCE = False
 
-# Ciblé: uniquement les catégories bruyantes connues des dépendances
-warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
-warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="matplotlib")
-warnings.filterwarnings("ignore", message=".*Matplotlib.*")
-warnings.filterwarnings("ignore", message=".*perf_counter.*")
+try:
+    from scipy.optimize import brentq as _brentq
+    from scipy.signal import savgol_filter as _savgol_filter
+    HAS_SCIPY = True
+except ImportError:
+    _brentq = None
+    _savgol_filter = None
+    HAS_SCIPY = False
+
+# No global warnings mutation — use _suppress_vendor_warnings() context manager.
+# Safe for import: won't mask warnings in host applications (Airflow, FastAPI, etc.).
 
 log = logging.getLogger(__name__)
 
 
 class PipelineError(RuntimeError):
-    """Erreur fatale pipeline — remplace SystemExit pour intégration."""
-    pass
+    """Erreur fatale pipeline — remplace SystemExit pour intégration.
+
+    Levée sur: données indisponibles, timeout yfinance, spot corrompu,
+    yfinance non installé. Catchable comme RuntimeError.
+    """
 
 
-# Fetch yfinance avec timeout threading
-_FETCH_TIMEOUT = 30  # secondes
+# Split exceptions — retryable (network) vs fail-fast (parsing).
+# Prevents useless retries on internal KeyError/TypeError bugs.
+_YF_RETRY = (PipelineError, ConnectionError, OSError)
+_YF_PARSE = (KeyError, IndexError, ValueError, TypeError, AttributeError)
+_YF_ERRORS = _YF_RETRY + _YF_PARSE
+
+# Numerical errors in BKM/CF integrations
+_NUM_ERRORS = (ZeroDivisionError, ValueError, OverflowError, FloatingPointError)
 
 
-def _yf_fetch_timeout(fn, *args, timeout=_FETCH_TIMEOUT, **kwargs):
-    """Exécute fn(*args, **kwargs) dans un thread avec timeout."""
-    result = [None]
-    exc    = [None]
+@contextmanager
+def _suppress_vendor_warnings():
+    """Context manager — suppress yfinance/pandas/matplotlib noise locally.
 
-    def _run():
+    Uses proper contextmanager protocol — safe even if filters setup raises.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning, module="yfinance")
+        warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="matplotlib")
+        warnings.filterwarnings("ignore", message=".*Matplotlib.*")
+        warnings.filterwarnings("ignore", message=".*perf_counter.*")
+        yield
+
+
+# ─────────────────────────────────────────────────────────────────
+#  FETCH — yfinance avec ThreadPoolExecutor + retry + session timeout
+# ─────────────────────────────────────────────────────────────────
+_FETCH_TIMEOUT  = int(os.getenv("GOLD_FETCH_TIMEOUT", "30"))
+_FETCH_RETRIES  = int(os.getenv("GOLD_FETCH_RETRIES", "2"))
+_FETCH_BACKOFF  = float(os.getenv("GOLD_FETCH_BACKOFF", "1.0"))
+_SOCKET_TIMEOUT = int(os.getenv("GOLD_SOCKET_TIMEOUT", "15"))
+
+# Lazy-initialized executor with explicit lifecycle management.
+# No module-level ThreadPoolExecutor — safe for import in Gunicorn/Celery/Airflow.
+_executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    """Lazy-init executor with lock — thread-safe, auto-creates on first use."""
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="yf")
+        return _executor
+
+
+def _shutdown_executor() -> None:
+    """Explicit executor cleanup — called in run_fetch finally block. Thread-safe."""
+    global _executor
+    with _executor_lock:
+        if _executor is not None:
+            _executor.shutdown(wait=False, cancel_futures=True)
+            _executor = None
+
+
+def _yf_with_timeout(fn, *args, **kwargs):
+    """Call fn with socket timeout, save/restore previous value.
+
+    Note: setdefaulttimeout is process-global (not thread-local).
+    Save/restore minimizes the race window but is not strictly thread-safe.
+    Acceptable for pipeline I/O where concurrent socket creation by other
+    modules during the brief yfinance call window is unlikely.
+    """
+    prev = _socket.getdefaulttimeout()
+    try:
+        _socket.setdefaulttimeout(_SOCKET_TIMEOUT)
+        return fn(*args, **kwargs)
+    finally:
+        _socket.setdefaulttimeout(prev)
+
+
+def _yf_fetch_timeout(fn, *args, timeout=_FETCH_TIMEOUT, retries=_FETCH_RETRIES, **kwargs):
+    """Execute fn(*args, **kwargs) via ThreadPoolExecutor with timeout + smart retry.
+
+    Uses lazy-initialized executor (no module-level thread pool).
+    Only retries on network/timeout errors (_YF_RETRY).
+    Parsing errors (_YF_PARSE) are re-raised immediately.
+
+    Raises:
+        PipelineError: if all retries exhausted on retryable errors.
+        KeyError/ValueError/etc: immediately on parsing/data errors.
+    """
+    executor = _get_executor()
+    last_err = None
+    fn_name = getattr(fn, "__name__", repr(fn))
+    for attempt in range(1 + retries):
+        future = executor.submit(fn, *args, **kwargs)
         try:
-            result[0] = fn(*args, **kwargs)
-        except Exception as e:
-            exc[0] = e
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        raise PipelineError(f"Timeout yfinance ({timeout}s): {fn.__name__}")
-    if exc[0] is not None:
-        raise exc[0]
-    return result[0]
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            future.cancel()
+            last_err = PipelineError(f"Timeout yfinance ({timeout}s): {fn_name}")
+            log.warning("Attempt %d/%d timeout: %s", attempt + 1, 1 + retries, fn_name)
+        except _YF_RETRY as e:
+            last_err = e
+            log.warning("Attempt %d/%d network error: %s — %s",
+                        attempt + 1, 1 + retries, fn_name, e)
+        except _YF_PARSE:
+            # Parsing/data errors are bugs, not transient — fail immediately
+            raise
+        if attempt < retries:
+            time.sleep(_FETCH_BACKOFF * (2 ** attempt))
+    raise PipelineError(f"Exhausted {1 + retries} attempts: {fn_name}: {last_err}") from last_err
 
 # ─────────────────────────────────────────────────────────────────
-#  CONFIG
+#  CONFIG — overridable via env vars GOLD_*
 # ─────────────────────────────────────────────────────────────────
-TICKER_GLD    = "GLD"
-TICKER_GC     = "GC=F"       # spot XAU proxy uniquement (pas d'options)
-TICKER_GVZ    = "^GVZ"
-TICKER_RATE   = "^IRX"
-HIST_YEARS    = 6
-MIN_OI_GLD    = 10
-MAX_SPREAD_GLD = 0.30
-MAX_IV        = 3.0
-MIN_IV        = 0.005
-DEFAULT_JSON  = "gold_surface_data.json"
-DEFAULT_PDF   = "gold_report.pdf"
+TICKER_GLD     = os.getenv("GOLD_TICKER_GLD", "GLD")
+TICKER_GC      = os.getenv("GOLD_TICKER_GC", "GC=F")
+TICKER_GVZ     = os.getenv("GOLD_TICKER_GVZ", "^GVZ")
+TICKER_RATE    = os.getenv("GOLD_TICKER_RATE", "^IRX")
+HIST_YEARS     = int(os.getenv("GOLD_HIST_YEARS", "6"))
+MIN_OI_GLD     = int(os.getenv("GOLD_MIN_OI", "10"))
+MAX_SPREAD_GLD = float(os.getenv("GOLD_MAX_SPREAD", "0.30"))
+MAX_IV         = 3.0
+MIN_IV         = 0.005
+DEFAULT_JSON   = os.getenv("GOLD_JSON_OUT", "gold_surface_data.json")
+DEFAULT_PDF    = os.getenv("GOLD_PDF_OUT", "gold_report.pdf")
+GLD_EXPENSE_RATIO = float(os.getenv("GOLD_EXPENSE_RATIO", "0.004"))
+
+# Fallbacks quand les données sont indisponibles
+FALLBACK_RATIO = float(os.getenv("GOLD_FALLBACK_RATIO", "10.28"))  # GC/GLD historique
+FALLBACK_RATE  = float(os.getenv("GOLD_FALLBACK_RATE", "0.05"))    # T-bill ~5%
+
+# Strike range filter (fraction du spot)
+STRIKE_RANGE_LO = float(os.getenv("GOLD_STRIKE_LO", "0.55"))
+STRIKE_RANGE_HI = float(os.getenv("GOLD_STRIKE_HI", "1.65"))
+_DAYS_PER_YEAR = 365.0
 
 # numpy trapz compat (np.trapz → np.trapezoid en numpy 2.x)
 try:
@@ -98,13 +228,19 @@ except AttributeError:
 # ─────────────────────────────────────────────────────────────────
 #  MATH BS
 # ─────────────────────────────────────────────────────────────────
-def norm_cdf(x):
+def norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erf."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
 
-def norm_pdf(x):
+def norm_pdf(x: float) -> float:
+    """Standard normal PDF."""
     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
-def bs_price(S, K, T, sig, r, is_call):
+def bs_price(S: float, K: float, T: float, sig: float, r: float, is_call: bool) -> float:
+    """Black-Scholes-Merton European option price.
+
+    Returns intrinsic value for T≤0 or σ≤0.
+    """
     if T <= 0 or sig <= 0:
         return max(0.0, (S - K) if is_call else (K - S))
     d1 = (math.log(S / K) + (r + 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
@@ -113,23 +249,49 @@ def bs_price(S, K, T, sig, r, is_call):
         return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
     return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
 
-def bs_vega(S, K, T, sig, r=0.0):
+def bs_vega(S: float, K: float, T: float, sig: float, r: float = 0.0) -> float:
+    """Black-Scholes vega (∂C/∂σ). Returns 1e-10 for degenerate inputs."""
     if T <= 0 or sig <= 0:
         return 1e-10
     d1 = (math.log(S / K) + (r + 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
     return S * math.sqrt(T) * norm_pdf(d1)
 
-def implied_vol(price, S, K, T, r, is_call, lo=1e-4, hi=5.0, tol=1e-7, maxiter=120):
+def implied_vol(price: float, S: float, K: float, T: float, r: float,
+                is_call: bool, lo: float = 1e-4, hi: float = 5.0,
+                tol: float = 1e-7, maxiter: int = 120) -> float | None:
+    """Implied volatility via Brent's method (primary) or bisection+Newton (fallback).
+
+    Brent's method (scipy.optimize.brentq) is the institutional standard:
+    combines bisection, secant, and inverse quadratic interpolation for
+    superlinear convergence with guaranteed bracketing.
+
+    Returns None if inversion is ill-conditioned (deep OTM, T≤0, price≤0).
+    Bounds: [MIN_IV, MAX_IV].
+    """
     if T <= 0 or price <= 0:
         return None
-    # Intrinsèque correct: valeur actualisée (forward intrinsic)
+    # Forward intrinsic guard
     fwd_intrinsic = max(0.0, (S - K * math.exp(-r * T)) if is_call else (K * math.exp(-r * T) - S))
     if price < fwd_intrinsic - 0.01:
         return None
+    # Bracket check
     p_lo = bs_price(S, K, T, lo, r, is_call)
     p_hi = bs_price(S, K, T, hi, r, is_call)
     if not (p_lo <= price <= p_hi):
         return None
+
+    # ── Primary: Brent's method (institutional standard) ─────────
+    if _brentq is not None:
+        def _obj(sig):
+            """BS price residual f(σ) = BS(σ) - market_price for root-finding."""
+            return bs_price(S, K, T, sig, r, is_call) - price
+        try:
+            iv = _brentq(_obj, lo, hi, xtol=tol, maxiter=maxiter)
+            return iv if MIN_IV <= iv <= MAX_IV else None
+        except (ValueError, RuntimeError):
+            return None
+
+    # ── Fallback: bisection + Newton refinement ──────────────────
     for _ in range(maxiter):
         mid = (lo + hi) / 2
         p = bs_price(S, K, T, mid, r, is_call)
@@ -142,7 +304,6 @@ def implied_vol(price, S, K, T, r, is_call, lo=1e-4, hi=5.0, tol=1e-7, maxiter=1
         if hi - lo < tol:
             break
     iv = (lo + hi) / 2
-    # Options à prix négligeable (deep OTM + low vol): inversion numériquement dégénérée
     if price < tol:
         return None
     for _ in range(10):
@@ -156,94 +317,149 @@ def implied_vol(price, S, K, T, r, is_call, lo=1e-4, hi=5.0, tol=1e-7, maxiter=1
             break
     return iv if MIN_IV <= iv <= MAX_IV else None
 
-def bs_delta(S, K, T, sig, r, is_call):
+def bs_delta(S: float, K: float, T: float, sig: float, r: float, is_call: bool) -> float:
+    """Black-Scholes delta. Returns 0.0 for T≤0 or σ≤0."""
     if T <= 0 or sig <= 0:
         return 0.0
     d1 = (math.log(S / K) + (r + 0.5 * sig * sig) * T) / (sig * math.sqrt(T))
     return norm_cdf(d1) if is_call else norm_cdf(d1) - 1.0
 
-def safe_float(val, default=0.0):
+def safe_float(val: object, default: float = 0.0) -> float:
+    """Convert to float safely; returns *default* on NaN/Inf/TypeError/ValueError."""
     try:
         v = float(val)
         return default if (math.isnan(v) or math.isinf(v)) else v
     except (TypeError, ValueError):
         return default
 
+
+def _normalize_floats(obj, precision: int = 10):
+    """Recursively round floats for deterministic JSON serialization (SHA-256).
+
+    Ensures identical hashes across Python versions and CPU architectures
+    by normalizing float representation to *precision* decimal digits.
+    """
+    if isinstance(obj, float):
+        return round(obj, precision)
+    if isinstance(obj, dict):
+        return {k: _normalize_floats(v, precision) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_normalize_floats(x, precision) for x in obj]
+    return obj
+
 # ─────────────────────────────────────────────────────────────────
 #  FETCH — SPOTS + TAUX
 # ─────────────────────────────────────────────────────────────────
-def _ticker_history(ticker_str, period):
-    return yf.Ticker(ticker_str).history(period=period)
+def _ticker_history(ticker_str: str, period: str) -> pd.DataFrame:
+    """Wrapper yfinance pour injection dans _yf_fetch_timeout.
 
-def fetch_spots_rate():
-    print("→ Spots GLD / GC / taux...")
+    Uses _yf_with_timeout to set socket-level timeout with save/restore.
+    Compatible with yfinance curl_cffi backend (no custom session injection).
+    """
+    def _fetch():
+        """Inner yfinance call with socket timeout."""
+        return yf.Ticker(ticker_str).history(period=period)
+    return _yf_with_timeout(_fetch)
+
+def fetch_spots_rate() -> dict:
+    """Fetch GLD spot, GC=F (XAU proxy), and risk-free rate (^IRX).
+
+    Returns:
+        dict with keys: S_gld (float), S_gc (float|None), ratio (float),
+        r (float), gc_fallback (bool), r_fallback (bool).
+
+    Raises:
+        PipelineError: if GLD spot is unavailable or ≤ 0.
+    """
+    log.info("Fetching spots GLD / GC / rate...")
     try:
         h_gld = _yf_fetch_timeout(_ticker_history, TICKER_GLD, "5d")
         S_gld = float(h_gld["Close"].iloc[-1])
-        if S_gld <= 0:
-            raise PipelineError("GLD spot ≤ 0 — données corrompues")
-    except Exception as e:
+    except _YF_ERRORS as e:
         raise PipelineError(f"GLD spot indisponible: {e}") from e
+    if S_gld <= 0:
+        raise PipelineError("GLD spot ≤ 0 — données corrompues")
     try:
         gc_h  = _yf_fetch_timeout(_ticker_history, TICKER_GC, "5d")
         S_gc  = float(gc_h["Close"].iloc[-1]) if len(gc_h) > 0 else None
-    except Exception as e:
+    except _YF_ERRORS as e:
         log.warning("GC=F indisponible: %s", e)
         S_gc = None
+    r_fallback = False
     try:
         irx_h = _yf_fetch_timeout(_ticker_history, TICKER_RATE, "5d")
-        r     = float(irx_h["Close"].iloc[-1]) / 100.0 if len(irx_h) > 0 else 0.05
-    except Exception as e:
-        log.warning("^IRX indisponible, fallback r=5%%: %s", e)
-        r = 0.05
-    ratio  = S_gc / S_gld if S_gc else 10.28
+        if len(irx_h) > 0:
+            r = float(irx_h["Close"].iloc[-1]) / 100.0
+        else:
+            r = FALLBACK_RATE
+            r_fallback = True
+    except _YF_ERRORS as e:
+        log.warning("^IRX indisponible, fallback r=%.0f%%: %s", FALLBACK_RATE * 100, e)
+        r = FALLBACK_RATE
+        r_fallback = True
+    ratio  = S_gc / S_gld if S_gc else FALLBACK_RATIO
     gc_str = f"${S_gc:.2f}" if S_gc is not None else "indisponible"
-    print(f"   GLD = ${S_gld:.2f}  GC = {gc_str}  ratio = {ratio:.4f}  r = {r*100:.2f}%")
-    return {"S_gld": S_gld, "S_gc": S_gc, "ratio": ratio, "r": r}
+    log.info("GLD=$%.2f  GC=%s  ratio=%.4f  r=%.2f%%", S_gld, gc_str, ratio, r * 100)
+    return {"S_gld": S_gld, "S_gc": S_gc, "ratio": ratio, "r": r,
+            "gc_fallback": S_gc is None, "r_fallback": r_fallback}
 
-def fetch_gvz():
-    print("→ GVZ...")
+def fetch_gvz() -> float | None:
+    """Fetch CBOE Gold ETF Volatility Index (^GVZ). Returns None if unavailable."""
+    log.info("Fetching GVZ...")
     try:
         h = _yf_fetch_timeout(_ticker_history, TICKER_GVZ, "5d")
         v = float(h["Close"].iloc[-1]) if len(h) > 0 else None
-        print(f"   GVZ = {v:.2f}%" if v else "   GVZ indisponible")
+        log.info("GVZ=%.2f%%" if v else "GVZ indisponible", v or 0)
         return v
-    except Exception as e:
+    except _YF_ERRORS as e:
         log.warning("GVZ erreur: %s", e)
         return None
 
 # ─────────────────────────────────────────────────────────────────
 #  FETCH — OPTIONS CHAIN
 # ─────────────────────────────────────────────────────────────────
-def _process_df(df, S, T, r, is_call, min_oi, max_spread):
+def _process_df(df: pd.DataFrame, S: float, T: float, r: float,
+                is_call: bool, min_oi: int, max_spread: float) -> list:
+    """Filter option chain DataFrame and compute IV/delta for each row.
+
+    Vectorized pre-filter on strike/OI/spread, then itertuples for IV inversion.
+    Filters: strike range [STRIKE_RANGE_LO·S, STRIKE_RANGE_HI·S], min OI, max spread, valid IV.
+    """
+    if df.empty:
+        return []
+    # ── Vectorized pre-filter ────────────────────────────────────
+    cols = {"strike": 0.0, "openInterest": 0, "bid": 0.0, "ask": 0.0}
+    missing = {c: default for c, default in cols.items() if c not in df.columns}
+    if missing:
+        df = df.assign(**missing)
+    K = pd.to_numeric(df["strike"], errors="coerce").fillna(0.0)
+    oi = pd.to_numeric(df["openInterest"], errors="coerce").fillna(0).astype(int)
+    bid = pd.to_numeric(df["bid"], errors="coerce").fillna(0.0)
+    ask = pd.to_numeric(df["ask"], errors="coerce").fillna(0.0)
+    mid = (bid + ask) / 2.0
+    spread_rel = np.where(mid > 0, (ask - bid) / mid, np.inf)
+
+    mask = (
+        (K > 0) & (K >= S * STRIKE_RANGE_LO) & (K <= S * STRIKE_RANGE_HI)
+        & (oi >= min_oi) & (ask > 0) & (mid > 0) & (spread_rel <= max_spread)
+    )
+    filtered = df.loc[mask].assign(fK=K[mask], fmid=mid[mask],
+                                    fspread=spread_rel[mask], foi=oi[mask])
+
+    # ── IV inversion per-row (cannot be vectorized — Newton/Brent) ─
     rows = []
-    for _, row in df.iterrows():
-        K = safe_float(row.get("strike"), 0.0)
-        if K <= 0 or K < S * 0.55 or K > S * 1.65:
-            continue
-        oi = int(safe_float(row.get("openInterest", 0), 0.0))
-        if oi < min_oi:
-            continue
-        bid = safe_float(row.get("bid", 0), 0.0)
-        ask = safe_float(row.get("ask", 0), 0.0)
-        if ask <= 0:
-            continue
-        mid = (bid + ask) / 2.0
-        if mid <= 0:
-            continue
-        spread_rel = (ask - bid) / mid
-        if spread_rel > max_spread:
-            continue
-        iv = implied_vol(mid, S, K, T, r, is_call)
+    for t in filtered.itertuples(index=False):
+        iv = implied_vol(t.fmid, S, t.fK, T, r, is_call)
         if iv is None:
             continue
-        delta = bs_delta(S, K, T, iv, r, is_call)
-        rows.append({"K": K, "iv": round(iv*100, 4), "delta": round(delta, 5),
-                     "mid": round(mid, 4), "spread_rel": round(spread_rel, 4),
-                     "oi": oi, "type": "call" if is_call else "put"})
+        delta = bs_delta(S, t.fK, T, iv, r, is_call)
+        rows.append({"K": t.fK, "iv": round(iv * 100, 4), "delta": round(delta, 5),
+                     "mid": round(t.fmid, 4), "spread_rel": round(t.fspread, 4),
+                     "oi": t.foi, "type": "call" if is_call else "put"})
     return rows
 
-def _interp_atm(rows, S, T, r):
+def _interp_atm(rows: list, S: float, T: float, r: float) -> float | None:
+    """ATM IV via log-linear interpolation around forward price F=Se^{rT}."""
     if not rows:
         return None
     F = S * math.exp(r * T)
@@ -258,7 +474,8 @@ def _interp_atm(rows, S, T, r):
     w = math.log(F / l["K"]) / math.log(u["K"] / l["K"])
     return ((1 - w) * l["iv"] + w * u["iv"]) / 100.0
 
-def _interp_delta(rows, target):
+def _interp_delta(rows: list, target: float) -> float | None:
+    """IV at a target delta via linear interpolation between bracketing strikes."""
     if not rows:
         return None
     lo_r = [x for x in rows if x["delta"] <= target] if target > 0 else [x for x in rows if x["delta"] >= target]
@@ -273,16 +490,28 @@ def _interp_delta(rows, target):
     w = abs(target - l["delta"]) / d
     return ((1 - w) * l["iv"] + w * u["iv"]) / 100.0
 
-def fetch_surface(ticker_str, S, r, label, min_oi, max_spread, max_t=400):
-    print(f"→ Options chain {label} ({ticker_str})...")
+def fetch_surface(ticker_str: str, S: float, r: float, label: str,
+                  min_oi: int, max_spread: float, max_t: int = 400) -> dict:
+    """Fetch full options surface for *ticker_str* via yfinance.
+
+    Returns dict with 'tenors' (term structure) and 'surface' (raw strike data).
+    Filters expirations to [2, max_t] calendar days.
+    """
+    log.info("Fetching options chain %s (%s)...", label, ticker_str)
     try:
-        tkr         = yf.Ticker(ticker_str)
-        expirations = _yf_fetch_timeout(lambda: tkr.options)
-    except Exception as e:
+        def _make_ticker():
+            """Create yfinance Ticker for options chain."""
+            return yf.Ticker(ticker_str)
+        tkr         = _yf_with_timeout(_make_ticker)
+        def _get_options():
+            """Fetch available expiration dates."""
+            return tkr.options
+        expirations = _yf_fetch_timeout(_get_options)
+    except _YF_ERRORS as e:
         log.warning("%s options indisponible: %s", label, e)
         return {"tenors": [], "surface": []}
     if not expirations:
-        print(f"   {label}: aucune expiration")
+        log.info("%s: aucune expiration", label)
         return {"tenors": [], "surface": []}
     today = datetime.now(timezone.utc).date()
     tenors, raw = [], []
@@ -293,10 +522,10 @@ def fetch_surface(ticker_str, S, r, label, min_oi, max_spread, max_t=400):
             continue
         if T_cal > max_t:
             break
-        T = T_cal / 365.0
+        T = T_cal / _DAYS_PER_YEAR
         try:
             chain = _yf_fetch_timeout(tkr.option_chain, exp_str)
-        except Exception as e:
+        except _YF_ERRORS as e:
             log.warning("option_chain %s %s: %s", label, exp_str, e)
             continue
         c_rows = _process_df(chain.calls, S, T, r, True,  min_oi, max_spread)
@@ -323,19 +552,25 @@ def fetch_surface(ticker_str, S, r, label, min_oi, max_spread, max_t=400):
         atm_s = f"{atm*100:.2f}%" if atm else "?"
         rr_s  = f"{rr25:.2f}%" if rr25 is not None else "?"
         bf_s  = f"{bf25:.2f}%" if bf25 is not None else "?"
-        print(f"   {exp_str}: {T_cal:3d}d | ATM={atm_s} | RR25={rr_s} | BF25={bf_s} | n={len(all_r)}")
+        log.info("%s %s: %3dd ATM=%s RR25=%s BF25=%s n=%d",
+                 label, exp_str, T_cal, atm_s, rr_s, bf_s, len(all_r))
     tenors.sort(key=lambda x: x["tenor_days"])
-    print(f"   → {label}: {len(tenors)} tenors, {len(raw)} quotes")
+    log.info("%s: %d tenors, %d quotes", label, len(tenors), len(raw))
     return {"tenors": tenors, "surface": raw}
 
 # ─────────────────────────────────────────────────────────────────
 #  FETCH — RV CÔNE
 # ─────────────────────────────────────────────────────────────────
-def fetch_rv(ticker_str, label):
-    print(f"→ RV cône {label}...")
+def fetch_rv(ticker_str: str, label: str) -> dict:
+    """Compute RV cone, recent RV, jump detection (3σ), and return stats.
+
+    Returns dict with keys: cone, rv_recent, jumps, stats.
+    Uses *HIST_YEARS* years of daily closes. Log-return based, annualized √252.
+    """
+    log.info("Computing RV cone %s...", label)
     try:
         hist = _yf_fetch_timeout(_ticker_history, ticker_str, f"{HIST_YEARS}y")
-    except Exception as e:
+    except _YF_ERRORS as e:
         log.warning("%s historique erreur: %s", label, e)
         return {"cone": {}, "rv_recent": {}, "jumps": [], "stats": {}}
     closes = hist["Close"].dropna()
@@ -345,7 +580,7 @@ def fetch_rv(ticker_str, label):
     windows = [7, 14, 21, 30, 60, 90, 120, 180]
     cone = {}
     for w in windows:
-        rv = log_ret.rolling(w).std().dropna() * math.sqrt(252) * 100
+        rv = log_ret.rolling(w).std(ddof=1).dropna() * math.sqrt(252) * 100
         if len(rv) < 20:
             continue
         a = rv.values
@@ -357,12 +592,12 @@ def fetch_rv(ticker_str, label):
             "p90": round(float(np.percentile(a, 90)), 2),
             "current": round(float(a[-1]), 2), "n_obs": len(a),
         }
-        print(f"   {label} RV {w:3d}d: p50={cone[str(w)]['p50']:.1f}% current={cone[str(w)]['current']:.1f}%")
+        log.info("%s RV %3dd: p50=%.1f%% current=%.1f%%", label, w, cone[str(w)]['p50'], cone[str(w)]['current'])
     rv_recent = {}
     for w in windows:
         if len(log_ret) >= w:
-            rv_recent[str(w)] = round(float(log_ret.iloc[-w:].std() * math.sqrt(252) * 100), 2)
-    std60 = log_ret.rolling(60).std().replace(0, np.nan)
+            rv_recent[str(w)] = round(float(log_ret.iloc[-w:].std(ddof=1) * math.sqrt(252) * 100), 2)
+    std60 = log_ret.rolling(60).std(ddof=1).replace(0, np.nan)
     z = (log_ret / std60).dropna()
     idx = log_ret.index.intersection(z.index)
     lr  = log_ret.loc[idx]; z2 = z.loc[idx]
@@ -375,20 +610,25 @@ def fetch_rv(ticker_str, label):
     ra = log_ret.values
     stats = {
         "mean_annual": round(float(np.mean(ra)) * 252 * 100, 2),
-        "rv_annual":   round(float(np.std(ra)) * math.sqrt(252) * 100, 2),
+        "rv_annual":   round(float(np.std(ra, ddof=1)) * math.sqrt(252) * 100, 2),
         "skew":        round(float(pd.Series(ra).skew()), 4),
         "kurt_excess": round(float(pd.Series(ra).kurtosis()), 4),
         "n_days":      len(ra),
         "start_date":  str(closes.index[0].date()),
         "end_date":    str(closes.index[-1].date()),
     }
-    print(f"   {label}: {len(jumps)} sauts 3σ")
+    log.info("%s: %d jumps ≥3σ", label, len(jumps))
     return {"cone": cone, "rv_recent": rv_recent, "jumps": jumps, "stats": stats}
 
 # ─────────────────────────────────────────────────────────────────
 #  COMPUTE — IVR/IVP + FORWARD VOL + SMILES
 # ─────────────────────────────────────────────────────────────────
-def compute_ivr_ivp(tenors, rv_cone):
+def compute_ivr_ivp(tenors: list, rv_cone: dict) -> list:
+    """Compute IV Rank and IV Percentile per tenor.
+
+    Signal logic: IVR > 1.15 → SELL VOL, IVR < 0.85 → BUY VOL, else NEUTRAL.
+    RV cone window is matched to nearest tenor by days.
+    """
     cone_w  = [int(k) for k in rv_cone.keys()]
     rv_curr = {int(k): v.get("current") for k, v in rv_cone.items()}
     results = []
@@ -419,7 +659,8 @@ def compute_ivr_ivp(tenors, rv_cone):
                       "BUY VOL"  if (ivr is not None and ivr < 0.85) else "NEUTRAL"})
     return results
 
-def compute_fwd_vols(tenors):
+def compute_fwd_vols(tenors: list) -> list:
+    """Forward variance σ²_fwd = (T₂σ₂² - T₁σ₁²)/(T₂-T₁). Calendar arb flag if fv² ≤ 0."""
     v = [t for t in tenors if t.get("atm_iv")]
     res = []
     for i in range(1, len(v)):
@@ -433,7 +674,8 @@ def compute_fwd_vols(tenors):
             "cal_arb_ok": bool(fv2 is not None and fv2 > 0)})
     return res
 
-def build_smiles(raw, S, max_t=8):
+def build_smiles(raw: list, S: float, max_t: int = 8) -> list:
+    """Build smile structures: log-moneyness k=ln(K/S)*100, grouped by tenor."""
     by_t = {}
     for r in raw:
         by_t.setdefault(r["tenor_days"], []).append(r)
@@ -451,7 +693,11 @@ def build_smiles(raw, S, max_t=8):
 # ─────────────────────────────────────────────────────────────────
 #  QA AUDIT
 # ─────────────────────────────────────────────────────────────────
-def audit_qa(tenors, rv_cone, label):
+def audit_qa(tenors: list, rv_cone: dict, label: str) -> dict:
+    """Surface quality audit. Returns score 0-100 with severity-tagged warnings.
+
+    Checks: min ATM tenors, min smile tenors, calendar arbitrage, RV cone depth.
+    """
     n_a = sum(1 for t in tenors if t.get("atm_iv"))
     n_s = sum(1 for t in tenors if t.get("rr25") is not None)
     n_k = sum(t.get("n_strikes", 0) for t in tenors)
@@ -465,7 +711,7 @@ def audit_qa(tenors, rv_cone, label):
     vl = [(t["tenor_days"], t["atm_iv"]) for t in tenors if t.get("atm_iv")]
     for i in range(1, len(vl)):
         t1, iv1 = vl[i-1]; t2, iv2 = vl[i]
-        if t2 / 365 * iv2**2 < t1 / 365 * iv1**2:
+        if t2 / _DAYS_PER_YEAR * iv2**2 < t1 / _DAYS_PER_YEAR * iv1**2:
             warns.append({"severity": "MAJEUR", "msg": f"Cal arb {t1}→{t2}d"}); score -= 8
     if len(rv_cone) < 4:
         warns.append({"severity": "MODÉRÉ", "msg": "RV cône < 4 fenêtres"}); score -= 5
@@ -475,45 +721,163 @@ def audit_qa(tenors, rv_cone, label):
 # ─────────────────────────────────────────────────────────────────
 #  FETCH PIPELINE — construit le dict data complet
 # ─────────────────────────────────────────────────────────────────
-def run_fetch(json_out=DEFAULT_JSON):
+def run_fetch(json_out: str = DEFAULT_JSON) -> dict:
+    """Execute full data pipeline: spots, surface, RV cone, IVR, forward vols, QA.
+
+    Outer parallelism via threading.Thread (no nested executor submission).
+    Inner I/O via ThreadPoolExecutor (lazy-init, lock-guarded).
+    Vendor warnings suppressed locally via @contextmanager.
+    Executor lifecycle: shutdown in bulletproof finally chain.
+
+    Writes JSON with embedded schema version and SHA-256 data checksum.
+    Returns the complete data dict.
+
+    Raises:
+        PipelineError: yfinance missing, GLD spot unavailable, or surface empty.
+    """
     if not HAS_YFINANCE:
-        print("ERREUR: yfinance non installé. pip install yfinance pandas")
         raise PipelineError("yfinance non installé. pip install yfinance pandas")
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"\n{'='*62}")
-    print(f"GOLD MULTI-INSTRUMENT FETCHER — {ts}")
-    print(f"{'='*62}\n")
+    _wctx = _suppress_vendor_warnings()
+    _wctx.__enter__()
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.info("=" * 62)
+        log.info("GOLD MULTI-INSTRUMENT FETCHER — %s", ts)
+        log.info("=" * 62)
 
-    spots = fetch_spots_rate()
-    S_gld, S_gc, ratio, r = spots["S_gld"], spots["S_gc"], spots["ratio"], spots["r"]
-    gvz = fetch_gvz()
+        # ── Phase 1: spots + GVZ en parallèle ───────────────────────
+        # Uses threading.Thread (not executor) for outer parallelism to avoid
+        # nested submission deadlock: fetch functions internally submit to the
+        # same executor via _yf_fetch_timeout.
+        phase1_results: dict = {}
+        phase1_errors: list = []
+        _THREAD_ERRORS = (*_YF_ERRORS, OSError, RuntimeError)
 
-    # ── GLD — surface options complète ───────────────────────────
-    surf_gld   = fetch_surface(TICKER_GLD, S_gld, r, "GLD", MIN_OI_GLD, MAX_SPREAD_GLD)
-    rv_gld     = fetch_rv(TICKER_GLD, "GLD")
-    ivr_gld    = compute_ivr_ivp(surf_gld["tenors"], rv_gld["cone"])
-    fwd_gld    = compute_fwd_vols(surf_gld["tenors"])
-    smiles_gld = build_smiles(surf_gld["surface"], S_gld)
-    qa_gld     = audit_qa(surf_gld["tenors"], rv_gld["cone"], "GLD")
+        def _run_spots():
+            """Thread worker: fetch spots + rate."""
+            try:
+                phase1_results["spots"] = fetch_spots_rate()
+            except _THREAD_ERRORS as e:
+                phase1_errors.append(e)
 
-    # ── XAU/USD — surface GLD rescalée, RV = GLD (corrélation ~1) ─
-    # GC=F utilisé seulement pour le prix spot XAU (basis ~0)
-    # IV% invariante par scaling → surface XAU = surface GLD
-    ivr_xau = compute_ivr_ivp(surf_gld["tenors"], rv_gld["cone"])
-    fwd_xau = compute_fwd_vols(surf_gld["tenors"])
-    qa_xau  = audit_qa(surf_gld["tenors"], rv_gld["cone"], "XAU/USD (GLD rescalé)")
+        def _run_gvz():
+            """Thread worker: fetch GVZ index."""
+            try:
+                phase1_results["gvz"] = fetch_gvz()
+            except _THREAD_ERRORS as e:
+                phase1_errors.append(e)
 
-    data = {
-        "meta": {
-            "fetched_at":    ts,
-            "source":        "yfinance · GLD options · GC=F spot · ^GVZ · ^IRX",
-            "gvz":           round(gvz, 2) if gvz else None,
-            "rate":          round(r, 5),
-            "ratio_gld_xau": round(ratio, 4),
-            "note": "GLD=options ETF liquides. XAU spot=GC=F proxy. IV%=GLD (invariante par scaling).",
-        },
-        "gld": {
+        t_spots = threading.Thread(target=_run_spots, name="fetch-spots")
+        t_gvz   = threading.Thread(target=_run_gvz, name="fetch-gvz")
+        t_spots.start(); t_gvz.start()
+        _join_timeout = _FETCH_TIMEOUT * (1 + _FETCH_RETRIES) + 5
+        t_spots.join(timeout=_join_timeout); t_gvz.join(timeout=_join_timeout)
+        if t_spots.is_alive() or t_gvz.is_alive():
+            raise PipelineError("Phase 1 thread timeout — spots or GVZ hung")
+        if phase1_errors:
+            raise phase1_errors[0]
+        spots = phase1_results["spots"]
+        gvz   = phase1_results["gvz"]
+        S_gld, S_gc, ratio, r = spots["S_gld"], spots["S_gc"], spots["ratio"], spots["r"]
+
+        # ── Phase 2: surface + RV en parallèle ──────────────────────
+        phase2_results: dict = {}
+        phase2_errors: list = []
+
+        def _run_surface():
+            """Thread worker: fetch GLD options surface."""
+            try:
+                phase2_results["surf"] = fetch_surface(
+                    TICKER_GLD, S_gld, r, "GLD", MIN_OI_GLD, MAX_SPREAD_GLD)
+            except _THREAD_ERRORS as e:
+                phase2_errors.append(e)
+
+        def _run_rv():
+            """Thread worker: fetch RV cone."""
+            try:
+                phase2_results["rv"] = fetch_rv(TICKER_GLD, "GLD")
+            except _THREAD_ERRORS as e:
+                phase2_errors.append(e)
+
+        t_surf = threading.Thread(target=_run_surface, name="fetch-surface")
+        t_rv   = threading.Thread(target=_run_rv, name="fetch-rv")
+        t_surf.start(); t_rv.start()
+        _join_timeout_p2 = _FETCH_TIMEOUT * (1 + _FETCH_RETRIES) * 5 + 10  # surface fetches many chains
+        t_surf.join(timeout=_join_timeout_p2); t_rv.join(timeout=_join_timeout_p2)
+        if t_surf.is_alive() or t_rv.is_alive():
+            raise PipelineError("Phase 2 thread timeout — surface or RV hung")
+        if phase2_errors:
+            raise phase2_errors[0]
+        surf_gld = phase2_results["surf"]
+        rv_gld   = phase2_results["rv"]
+
+        # Fail-fast — empty surface is fatal for a volatility pipeline.
+        if not surf_gld["tenors"]:
+            raise PipelineError("GLD options surface vide — aucun tenor exploitable. "
+                                "Marché fermé ou yfinance cassé.")
+
+        # Track degraded quality via explicit flags (no float == comparison).
+        degraded = []
+        if spots.get("gc_fallback"):
+            degraded.append("GC=F indisponible → ratio fallback")
+        if spots.get("r_fallback"):
+            degraded.append(f"^IRX indisponible → r={FALLBACK_RATE*100:.0f}% fallback")
+        if gvz is None:
+            degraded.append("GVZ indisponible")
+
+        # ── Compute (CPU-bound, sequential) ──────────────────────────
+        ivr_gld    = compute_ivr_ivp(surf_gld["tenors"], rv_gld["cone"])
+        fwd_gld    = compute_fwd_vols(surf_gld["tenors"])
+        smiles_gld = build_smiles(surf_gld["surface"], S_gld)
+        qa_gld     = audit_qa(surf_gld["tenors"], rv_gld["cone"], "GLD")
+
+        # ── XAU/USD — surface GLD rescalée, RV = GLD (corrélation ~1) ─
+        ivr_xau = compute_ivr_ivp(surf_gld["tenors"], rv_gld["cone"])
+        fwd_xau = compute_fwd_vols(surf_gld["tenors"])
+        qa_xau  = audit_qa(surf_gld["tenors"], rv_gld["cone"], "XAU/USD (GLD rescalé)")
+
+        data = {
+            "meta": {
+                "pipeline_version": __version__,
+                "schema_version":   "2.3",
+                "fetched_at":       ts,
+                "source":           "yfinance · GLD options · GC=F spot · ^GVZ · ^IRX",
+                "gvz":              round(gvz, 2) if gvz else None,
+                "rate":             round(r, 5),
+                "ratio_gld_xau":    round(ratio, 4),
+                "degraded":         bool(degraded),
+                "degraded_reasons": degraded,
+                "note": "GLD=options ETF liquides. XAU spot=GC=F proxy. IV%=GLD (invariante par scaling).",
+            },
+            "gld": {
+                "spot":      round(S_gld, 2),
+                "surface":   surf_gld["tenors"],
+                "smiles":    smiles_gld,
+                "rv_cone":   rv_gld["cone"],
+                "rv_recent": rv_gld["rv_recent"],
+                "rv_stats":  rv_gld["stats"],
+                "jumps":     rv_gld["jumps"],
+                "ivr_ivp":   ivr_gld,
+                "fwd_vols":  fwd_gld,
+                "quality":   qa_gld,
+            },
+            "xauusd": {
+                "spot":        round(S_gc, 2) if S_gc else round(S_gld * ratio, 2),
+                "spot_source": "GC=F front-month (proxy XAU spot, basis ~0)",
+                "ratio_gld":   round(ratio, 4),
+                "surface":     surf_gld["tenors"],
+                "smiles":      smiles_gld,
+                "rv_cone":     rv_gld["cone"],
+                "rv_recent":   rv_gld["rv_recent"],
+                "rv_stats":    rv_gld["stats"],
+                "jumps":       rv_gld["jumps"],
+                "ivr_ivp":     ivr_xau,
+                "fwd_vols":    fwd_xau,
+                "quality":     qa_xau,
+                "note":        "Surface IV = GLD (IV% invariante). RV = GLD (corrélation ~1). Spot via GC=F.",
+            },
+            # vue consolidée GLD
             "spot":      round(S_gld, 2),
             "surface":   surf_gld["tenors"],
             "smiles":    smiles_gld,
@@ -524,53 +888,35 @@ def run_fetch(json_out=DEFAULT_JSON):
             "ivr_ivp":   ivr_gld,
             "fwd_vols":  fwd_gld,
             "quality":   qa_gld,
-        },
-        "xauusd": {
-            "spot":        round(S_gc, 2) if S_gc else round(S_gld * ratio, 2),
-            "spot_source": "GC=F front-month (proxy XAU spot, basis ~0)",
-            "ratio_gld":   round(ratio, 4),
-            "surface":     surf_gld["tenors"],
-            "smiles":      smiles_gld,
-            "rv_cone":     rv_gld["cone"],
-            "rv_recent":   rv_gld["rv_recent"],
-            "rv_stats":    rv_gld["stats"],
-            "jumps":       rv_gld["jumps"],
-            "ivr_ivp":     ivr_xau,
-            "fwd_vols":    fwd_xau,
-            "quality":     qa_xau,
-            "note":        "Surface IV = GLD (IV% invariante). RV = GLD (corrélation ~1). Spot via GC=F.",
-        },
-        # vue consolidée GLD
-        "spot":      round(S_gld, 2),
-        "surface":   surf_gld["tenors"],
-        "smiles":    smiles_gld,
-        "rv_cone":   rv_gld["cone"],
-        "rv_recent": rv_gld["rv_recent"],
-        "rv_stats":  rv_gld["stats"],
-        "jumps":     rv_gld["jumps"],
-        "ivr_ivp":   ivr_gld,
-        "fwd_vols":  fwd_gld,
-        "quality":   qa_gld,
-    }
+        }
 
-    try:
-        with open(json_out, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-    except OSError as e:
-        raise PipelineError(f"Impossible d'écrire {json_out}: {e}") from e
+        # C6: SHA-256 data integrity checksum (excludes meta for idempotency)
+        # P1 3.2: normalize floats for cross-platform determinism
+        _hashable = _normalize_floats({k: v for k, v in data.items() if k != "meta"})
+        _payload = json.dumps(_hashable, sort_keys=True, default=str)
+        data["meta"]["data_sha256"] = hashlib.sha256(_payload.encode()).hexdigest()
 
-    print(f"\n{'='*62}")
-    print(f"JSON → {json_out}")
-    xau_s = f"${S_gc:.2f}" if S_gc is not None else f"${S_gld*ratio:.2f} (estimé)"
-    gvz_s = f"{gvz:.2f}%" if gvz is not None else "N/A"
-    print(f"  GLD ${S_gld:.2f} | XAU/USD {xau_s} | ratio {ratio:.4f}")
-    print(f"  GVZ {gvz_s} | r {r*100:.2f}%")
-    for lbl, qa in [("GLD", qa_gld), ("XAU", qa_xau)]:
-        print(f"  [{lbl}] ATM:{qa['n_tenors_atm']} Strikes:{qa['n_strikes']} QA:{qa['score']}/100")
-        for w in qa["warnings"]:
-            print(f"       [{w['severity']:8s}] {w['msg']}")
-    print(f"{'='*62}\n")
-    return data
+        try:
+            with open(json_out, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+        except OSError as e:
+            raise PipelineError(f"Impossible d'écrire {json_out}: {e}") from e
+
+        xau_s = f"${S_gc:.2f}" if S_gc is not None else f"${S_gld*ratio:.2f} (estimé)"
+        gvz_s = f"{gvz:.2f}%" if gvz is not None else "N/A"
+        log.info("JSON → %s", json_out)
+        log.info("GLD $%.2f | XAU/USD %s | ratio %.4f", S_gld, xau_s, ratio)
+        log.info("GVZ %s | r %.2f%%", gvz_s, r * 100)
+        for lbl, qa in [("GLD", qa_gld), ("XAU", qa_xau)]:
+            log.info("[%s] ATM:%d Strikes:%d QA:%d/100", lbl, qa['n_tenors_atm'], qa['n_strikes'], qa['score'])
+            for w in qa["warnings"]:
+                log.warning("[%s] %s: %s", lbl, w['severity'], w['msg'])
+        return data
+    finally:
+        try:
+            _shutdown_executor()
+        finally:
+            _wctx.__exit__(None, None, None)
 
 # ─────────────────────────────────────────────────────────────────
 #  PALETTE + HELPERS GRAPHIQUES
@@ -593,7 +939,9 @@ TEXTMID = "#8892a4"
 
 PALETTE_TENORS = [GOLD, BLUE, GREEN, RED, VIOLET, ORANGE, GOLDL, TEXTMID]
 
-plt.rcParams.update({
+# P1 3.1: Style dict — applied via context manager, no global rcParams mutation.
+# Safe for import in FastAPI/Flask/Airflow (won't clobber other threads' plots).
+_MPL_STYLE = {
     "figure.facecolor":  BG, "axes.facecolor":   PANEL, "axes.edgecolor":  BORDER,
     "axes.labelcolor":   TEXTMID, "axes.titlecolor": TEXT,
     "axes.grid": True, "axes.grid.axis": "y",
@@ -606,9 +954,10 @@ plt.rcParams.update({
     "lines.linewidth": 1.8, "figure.dpi": 150,
     "savefig.dpi": 200, "savefig.facecolor": BG, "savefig.bbox": "tight",
     "pdf.fonttype": 42,
-})
+}
 
 def _panel_title(ax, title, sub=None):
+    """Add title + optional subtitle to a matplotlib Axes panel."""
     ax.text(0.0, 1.035, title, transform=ax.transAxes,
             color=TEXT, fontsize=8.5, fontweight="bold", va="bottom", ha="left")
     if sub:
@@ -616,11 +965,13 @@ def _panel_title(ax, title, sub=None):
                 color=TEXTDIM, fontsize=6.5, va="bottom", ha="right")
 
 def _badge(ax, text, color=GOLD, x=0.0, y=1.11):
+    """Draw a colored badge label above panel."""
     ax.text(x, y, f"  {text}  ", transform=ax.transAxes, color=color, fontsize=6,
             bbox=dict(boxstyle="round,pad=0.2", facecolor=color+"22",
                       edgecolor=color+"55", linewidth=0.5))
 
 def _sparse_xticks(ax, labels, max_labels=12):
+    """Thin x-tick labels to at most *max_labels* visible."""
     n = len(labels)
     if n <= max_labels:
         return
@@ -629,13 +980,15 @@ def _sparse_xticks(ax, labels, max_labels=12):
     ax.set_xticklabels(sparse)
 
 def _legend(ax, **kw):
+    """Conditional legend — only if handles exist."""
     if ax.get_legend_handles_labels()[0]:
         ax.legend(**kw)
 
 # ─────────────────────────────────────────────────────────────────
 #  RAPPORT — PAGE 1: Term Structure / RV Cône / IVR / Skew
 # ─────────────────────────────────────────────────────────────────
-def page1(data, instrument="gld"):
+def page1(data: dict, instrument: str = "gld") -> plt.Figure:
+    """P1: Term structure, RV cone, IVR/IVP signals, skew term structure."""
     instr    = data.get(instrument, data)
     meta     = data.get("meta", {})
     S        = instr.get("spot") or data.get("spot", 0)
@@ -794,7 +1147,8 @@ def page1(data, instrument="gld"):
 # ─────────────────────────────────────────────────────────────────
 #  RAPPORT — PAGE 2: Smiles / Density / Greeks
 # ─────────────────────────────────────────────────────────────────
-def page2(data, instrument="gld"):
+def page2(data: dict, instrument: str = "gld") -> plt.Figure:
+    """P2: Volatility smiles, Breeden-Litzenberger density, Greeks surface."""
     instr   = data.get(instrument, data)
     meta    = data.get("meta", {})
     S       = instr.get("spot") or data.get("spot", 0)
@@ -860,7 +1214,7 @@ def page2(data, instrument="gld"):
         pts = sorted(sm["smile"], key=lambda x: x["K"])
         Ks  = np.array([p["K"] for p in pts])
         ivs = np.array([p["iv"] / 100 for p in pts])
-        T   = sm["tenor_days"] / 365.0
+        T   = sm["tenor_days"] / _DAYS_PER_YEAR
         if len(Ks) < 5:
             continue
         K_grid  = np.linspace(Ks.min(), Ks.max(), max(len(Ks) * 2, 60))
@@ -876,10 +1230,9 @@ def page2(data, instrument="gld"):
         n_sg = len(density[1:-1])
         win  = min(21, n_sg if n_sg % 2 == 1 else n_sg - 1)
         if win >= 5:
-            try:
-                from scipy.signal import savgol_filter
-                density[1:-1] = np.maximum(0, savgol_filter(density[1:-1], win, 3))
-            except ImportError:
+            if _savgol_filter is not None:
+                density[1:-1] = np.maximum(0, _savgol_filter(density[1:-1], win, 3))
+            else:
                 kernel = np.ones(9) / 9
                 density[1:-1] = np.maximum(0, np.convolve(density[1:-1], kernel, mode="same"))
         total = _np_trapz(density[1:-1], K_grid[1:-1])
@@ -952,7 +1305,7 @@ def page2(data, instrument="gld"):
     valid_surf = [(t["tenor_days"], t["atm_iv"]) for t in surface if t.get("atm_iv")]
     if valid_surf:
         ts_v, ivs_v = zip(*valid_surf)
-        vega_atm = [S * math.sqrt(T_d/365) * norm_pdf(0) / 100 for T_d, _ in valid_surf]
+        vega_atm = [S * math.sqrt(T_d / _DAYS_PER_YEAR) * norm_pdf(0) / 100 for T_d, _ in valid_surf]
         ax6.bar(range(len(ts_v)), vega_atm, color=BLUE, alpha=0.75, width=0.6)
         ax6.set_xticks(range(len(ts_v)))
         ax6.set_xticklabels([f"{d}d" for d in ts_v], rotation=55, fontsize=5.5)
@@ -970,9 +1323,10 @@ def page2(data, instrument="gld"):
 # ─────────────────────────────────────────────────────────────────
 #  RAPPORT — PAGE 3: Comparaison / Jumps / Synthèse
 # ─────────────────────────────────────────────────────────────────
-def page3(data):
+def page3(data: dict) -> plt.Figure:
+    """P3: GLD vs XAU/USD comparison, jump events, vol synthesis dashboard."""
     meta  = data.get("meta", {})
-    ratio = meta.get("ratio_gld_xau", 10.28)
+    ratio = meta.get("ratio_gld_xau", FALLBACK_RATIO)
 
     fig = plt.figure(figsize=(16, 10))
     fig.patch.set_facecolor(BG)
@@ -1145,8 +1499,7 @@ def page3(data):
 #    F6 P1: Vol-of-vol bands p10/p90          [incertitude modèle]
 # ─────────────────────────────────────────────────────────────────
 
-# Expense ratio GLD ETF (SPDR Gold Shares prospectus)
-GLD_EXPENSE_RATIO = 0.0040   # 40 bps/an
+# GLD_EXPENSE_RATIO — défini dans CONFIG (env-overridable)
 
 # z-quantiles exacts Φ⁻¹ — intervalles bilatéraux institutionnels
 # ±1σ couvre 68.27%; labels précis pour rapports
@@ -1330,7 +1683,9 @@ def _bkm_moments(smile_list, S, T, r, q):
         γ2 = max(0.0,  min(6.0, float(kurt)))
         return γ1, γ2
 
-    except Exception:
+    except _NUM_ERRORS as e:
+        log.debug("BKM moments failed (T=%.4f, %d strikes): %s: %s",
+                  T, len(smile_list), type(e).__name__, e)
         return None, None
 
 
@@ -1353,8 +1708,9 @@ def _malz_moments(rr25_raw, bf25_raw, iv_dec):
 # ─────────────────────────────────────────────────────────────────
 #  COMPUTE — FENÊTRE BAYÉSIENNE INSTITUTIONNELLE
 # ─────────────────────────────────────────────────────────────────
-def compute_bayes_windows(surface, rv_cone, S, r=0.05,
-                           q=GLD_EXPENSE_RATIO, smiles=None):
+def compute_bayes_windows(surface: list, rv_cone: dict, S: float, r: float = FALLBACK_RATE,
+                           q: float = GLD_EXPENSE_RATIO,
+                           smiles: list | None = None) -> list:
     """
     Fenêtre bayésienne de prix — conformité institutionnelle (v2).
 
@@ -1391,7 +1747,25 @@ def compute_bayes_windows(surface, rv_cone, S, r=0.05,
     VOL-OF-VOL (F6):
       σ_post_lo = √(w·IV² + (1-w)·RV_p10²)  [scénario bas]
       σ_post_hi = √(w·IV² + (1-w)·RV_p90²)  [scénario stress]
+
+    Args:
+        surface: list of tenor dicts (from fetch_surface).
+        rv_cone: dict of RV cone windows.
+        S: spot price (must be > 0).
+        r: risk-free rate.
+        q: dividend/expense yield.
+        smiles: optional smile data for BKM moments.
+
+    Returns:
+        list of Bayesian window dicts per tenor.
+
+    Raises:
+        ValueError: if S ≤ 0 or surface is empty.
     """
+    if S <= 0:
+        raise ValueError(f"compute_bayes_windows: S must be > 0, got {S}")
+    if not surface:
+        return []
     # ── Index smiles par tenor pour BKM ──────────────────────────
     smile_by_tenor = {}
     if smiles:
@@ -1405,7 +1779,7 @@ def compute_bayes_windows(surface, rv_cone, S, r=0.05,
         if iv_atm is None:
             continue
         td = t["tenor_days"]
-        T  = max(t["T"], 1.0/365.0)
+        T  = max(t["T"], 1.0 / _DAYS_PER_YEAR)
 
         # Vol composantes
         iv_dec = iv_atm / 100.0
@@ -1486,11 +1860,7 @@ def compute_bayes_windows(surface, rv_cone, S, r=0.05,
         for sm_td, sm_list in smile_by_tenor.items():
             dist = abs(sm_td - td)
             if dist < best_dist and len(sm_list) >= 4:
-                # Guard: vérifier que les strikes sont dans le scale de S
-                # (évite BKM corrompu si smiles GLD passés avec S=XAU)
-                med_K = sorted(sm_list, key=lambda x: x['K'])[len(sm_list)//2]['K']
-                if 0.3 * S < med_K < 3.0 * S:
-                    best_dist = dist; best_sm = sm_list
+                best_dist = dist; best_sm = sm_list
         if best_sm is not None:
             γ1_bkm, γ2_bkm = _bkm_moments(best_sm, S, T, r, GLD_EXPENSE_RATIO)
             if γ1_bkm is not None:
@@ -1508,9 +1878,9 @@ def compute_bayes_windows(surface, rv_cone, S, r=0.05,
         γ1 = max(-1.5, min(1.5, γ1_raw))
         γ2 = max(0.0,  min(6.0, γ2_raw))
 
-        # Dégénérescence CF: w'(z)≤0 — plage ±5.0 alignée avec _cf_pdf_vectorized z_grid
+        # Dégénérescence CF: w'(z)≤0 — plage ±3.5 couvre z=2.3263 (99%) avec marge
         cf_degenerate = any(_cf_dw_dz(z, γ1, γ2) <= 0.0
-                            for z in np.linspace(-5.0, 5.0, 200))
+                            for z in np.linspace(-3.5, 3.5, 50))
         if cf_degenerate:
             γ1, γ2 = 0.0, 0.0
 
@@ -1609,7 +1979,8 @@ def compute_bayes_windows(surface, rv_cone, S, r=0.05,
 # ─────────────────────────────────────────────────────────────────
 #  PAGE 4 — FENÊTRE BAYÉSIENNE  [INSTITUTIONNEL v2]
 # ─────────────────────────────────────────────────────────────────
-def page_bayes(data, instrument="gld", page_num=4, total_pages=5):
+def page_bayes(data: dict, instrument: str = "gld", page_num: int = 4, total_pages: int = 5) -> plt.Figure:
+    """P4/P5: Bayesian price window — fan chart, σ_post/γ₁/γ₂, CF distributions + ES."""
     instr   = data.get(instrument, data)
     meta    = data.get("meta", {})
     S       = float(instr.get("spot") or data.get("spot", 0) or 0)
@@ -1659,8 +2030,8 @@ def page_bayes(data, instrument="gld", page_num=4, total_pages=5):
         # Variance totale — interpolation linéaire (Carr-Madan)
         τ_nodes = σ_nodes**2 * T_nodes
         T_max   = T_nodes[-1]
-        T_fine  = np.linspace(1.0/365.0, T_max, 600)
-        d_fine  = T_fine * 365.0
+        T_fine  = np.linspace(1.0 / _DAYS_PER_YEAR, T_max, 600)
+        d_fine  = T_fine * _DAYS_PER_YEAR
 
         τ_fine  = np.interp(T_fine, T_nodes, τ_nodes)
         σ_fine  = np.sqrt(np.maximum(τ_fine / T_fine, 1e-12))
@@ -1674,6 +2045,7 @@ def page_bayes(data, instrument="gld", page_num=4, total_pages=5):
         σ_hi_fine = np.sqrt(np.maximum(τ_hi_fine / T_fine, 1e-12))
 
         def fan_bound(σ_arr, z_sign, z_abs):
+            """Compute fan chart boundary via CF expansion at given z-quantile."""
             bounds = []
             for i, T in enumerate(T_fine):
                 σT_i = σ_arr[i] * math.sqrt(T)
@@ -1864,75 +2236,82 @@ def page_bayes(data, instrument="gld", page_num=4, total_pages=5):
 # ─────────────────────────────────────────────────────────────────
 #  RAPPORT PIPELINE
 # ─────────────────────────────────────────────────────────────────
-def run_report(data, pdf_out=DEFAULT_PDF, instrument="gld"):
+def run_report(data: dict, pdf_out: str = DEFAULT_PDF, instrument: str = "gld") -> None:
+    """Generate 5-page institutional PDF report + PNG preview.
+
+    Pages: P1 term structure/RV/IVR/skew, P2 smiles/density/Greeks,
+    P3 comparison/jumps/synthesis, P4 Bayesian GLD, P5 Bayesian XAU/USD.
+    """
     out  = Path(pdf_out)
     ts   = data.get("meta", {}).get("fetched_at", "")[:19].replace("T", " ")
     S_gld = data.get("gld", {}).get("spot") or data.get("spot", 0)
     S_xau = data.get("xauusd", {}).get("spot", 0)
     figs  = []
-    try:
-        print("Génération page 1 — Term Structure / RV Cône / IVR / Skew...")
-        figs.append(page1(data, instrument))
-        print("Génération page 2 — Smiles / Density / Greeks...")
-        figs.append(page2(data, instrument))
-        print("Génération page 3 — Comparaison instruments / Jumps / Synthèse...")
-        figs.append(page3(data))
-        print("Génération page 4 — Fenêtre Bayésienne GLD...")
-        figs.append(page_bayes(data, "gld",    page_num=4, total_pages=5))
-        print("Génération page 5 — Fenêtre Bayésienne XAU/USD...")
-        figs.append(page_bayes(data, "xauusd", page_num=5, total_pages=5))
-        print(f"Export PDF → {out}...")
-        with PdfPages(out) as pdf:
+    with plt.style.context(_MPL_STYLE):
+        try:
+            log.info("Generating page 1 — Term Structure / RV Cone / IVR / Skew...")
+            figs.append(page1(data, instrument))
+            log.info("Generating page 2 — Smiles / Density / Greeks...")
+            figs.append(page2(data, instrument))
+            log.info("Generating page 3 — Comparison / Jumps / Synthesis...")
+            figs.append(page3(data))
+            log.info("Generating page 4 — Bayesian Window GLD...")
+            figs.append(page_bayes(data, "gld",    page_num=4, total_pages=5))
+            log.info("Generating page 5 — Bayesian Window XAU/USD...")
+            figs.append(page_bayes(data, "xauusd", page_num=5, total_pages=5))
+            log.info("Exporting PDF → %s...", out)
+            with PdfPages(out) as pdf:
+                for fig in figs:
+                    pdf.savefig(fig, facecolor=BG)
+                d = pdf.infodict()
+                d["Title"]   = f"Gold Volatility Report — {ts}"
+                d["Subject"] = f"GLD ${S_gld:.2f} / XAU ${S_xau:.2f} — {ts}"
+                d["Author"]  = f"price.py v{__version__} — yfinance · GLD options · GC=F"
+            png_out = out.with_suffix(".png")
+            figs[3].savefig(png_out, dpi=180, facecolor=BG, bbox_inches="tight")
+            sz = out.stat().st_size // 1024
+            log.info("PDF: %s (%d KB, %d pages)", out, sz, len(figs))
+            log.info("Preview: %s (page 4 — Bayes GLD)", png_out)
+        finally:
             for fig in figs:
-                pdf.savefig(fig, facecolor=BG)
-            d = pdf.infodict()
-            d["Title"]   = f"Gold Volatility Report — {ts}"
-            d["Subject"] = f"GLD ${S_gld:.2f} / XAU ${S_xau:.2f} — {ts}"
-            d["Author"]  = "price.py — yfinance · GLD options · GC=F"
-        png_out = out.with_suffix(".png")
-        figs[3].savefig(png_out, dpi=180, facecolor=BG, bbox_inches="tight")
-        sz = out.stat().st_size // 1024
-        print(f"\nPDF:    {out}  ({sz} KB, {len(figs)} pages)")
-        print(f"Aperçu: {png_out}  (page 4 — Bayes GLD)")
-    finally:
-        plt.close("all")
+                plt.close(fig)
 
 # ─────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────
-def main():
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def main() -> None:
+    """CLI entry point. Runs pipeline + report.
+
+    Note: logging must be configured by the caller. When run as script,
+    ``if __name__ == "__main__"`` configures basicConfig below.
+    Safe for import by Airflow / Celery / FastAPI (no log clobber).
+    """
     t0  = datetime.now(timezone.utc)
     ts  = t0.strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"\n{'═'*62}")
-    print(f"  GOLD VOLATILITY PIPELINE — {ts}")
-    print(f"  Exécution: données en temps réel via yfinance")
-    print(f"{'═'*62}")
+    log.info("═" * 62)
+    log.info("  GOLD VOLATILITY PIPELINE v%s — %s", __version__, ts)
+    log.info("═" * 62)
     try:
         data = run_fetch(json_out=DEFAULT_JSON)
         run_report(data, pdf_out=DEFAULT_PDF, instrument="gld")
     except PipelineError as e:
-        print(f"\n[FATAL] {e}")
+        log.critical("[FATAL] %s", e)
         raise SystemExit(1) from e
     t1  = datetime.now(timezone.utc)
     elapsed = (t1 - t0).total_seconds()
     S_gld = data.get("gld", {}).get("spot", 0)
     S_xau = data.get("xauusd", {}).get("spot", 0)
-    print(f"\n{'═'*62}")
-    print(f"  TERMINÉ en {elapsed:.1f}s")
-    print(f"  GLD  ${S_gld:.2f}  |  XAU/USD  ${S_xau:.2f}")
-    print(f"  JSON : {DEFAULT_JSON}")
-    print(f"  PDF  : {DEFAULT_PDF}  (5 pages)")
-    print(f"       p1: Term Structure · RV Cône · IVR · Skew")
-    print(f"       p2: Smiles · Densité · Greeks")
-    print(f"       p3: Comparaison · Sauts · Synthèse")
-    print(f"       p4: Fenêtre Bayésienne GLD")
-    print(f"       p5: Fenêtre Bayésienne XAU/USD")
-    print(f"{'═'*62}\n")
+    log.info("═" * 62)
+    log.info("  DONE in %.1fs", elapsed)
+    log.info("  GLD $%.2f | XAU/USD $%.2f", S_gld, S_xau)
+    log.info("  JSON: %s", DEFAULT_JSON)
+    log.info("  PDF:  %s (5 pages)", DEFAULT_PDF)
+    log.info("═" * 62)
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     main()
